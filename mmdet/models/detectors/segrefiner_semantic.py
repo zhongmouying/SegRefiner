@@ -33,7 +33,7 @@ class SegRefinerSemantic(SegRefiner):
         output_file = self.get_output_filename(img_metas)
 
         if coarse_masks[0].masks.sum() <= 128:
-            return [(np.zeros_like(coarse_masks[0].masks[0]), output_file)]
+            return [(np.zeros_like(coarse_masks[0].masks[0]), output_file, None)]
         
         current_device = img.device
         ori_shape = img_metas[0]['ori_shape'][:2]
@@ -48,7 +48,6 @@ class SegRefinerSemantic(SegRefiner):
                                                         global_indices, 
                                                         current_device, 
                                                         use_last_step=True)
-        
         ori_size_mask = F.interpolate(model_size_mask, size=ori_shape)
         ori_size_mask = (ori_size_mask >= 0.5).float()
 
@@ -56,7 +55,8 @@ class SegRefinerSemantic(SegRefiner):
         patch_imgs, patch_masks, patch_fine_probs, patch_coors = \
             self.get_local_input(img, ori_size_mask, fine_probs, ori_shape)
         if patch_imgs is None:
-            return [(ori_size_mask[0, 0].cpu().numpy(), output_file)]
+            out_probs = F.interpolate(fine_probs, size=ori_size_mask.shape[2:], mode='bilinear', align_corners=False)
+            return [(ori_size_mask[0, 0].cpu().numpy(), output_file, out_probs[0, 0].cpu().numpy())]
         
         batch_max = self.test_cfg.get('batch_max', 0)
         num_ins = len(patch_imgs)
@@ -68,17 +68,17 @@ class SegRefinerSemantic(SegRefiner):
                 end = min(num_ins, idx + batch_max)
                 xs.append((patch_masks[idx: end], patch_imgs[idx:end], patch_fine_probs[idx:end]))
 
-        local_masks, _ = self.p_sample_loop(xs, 
+        local_masks, local_probs = self.p_sample_loop(xs, 
                                             local_indices, 
                                             patch_imgs.device,
                                             use_last_step=True)
         
-        # local_masks = (local_masks >= 0.5).float()
-        # local_save(patch_imgs, local_masks, patch_masks, torch.zeros_like(local_masks), img_metas, 'local')
-        
         mask = self.paste_local_patch(local_masks, ori_size_mask, patch_coors)
-        return [(mask.cpu().numpy(), output_file)]
-        # return [(mask.cpu().numpy(), 'test_hr.png')]
+        
+        fine_probs_resized = F.interpolate(fine_probs, size=ori_size_mask.shape[2:], mode='bilinear', align_corners=False)
+        final_prob = self.paste_local_probs_patch(local_probs, fine_probs_resized, patch_coors)
+
+        return [(mask.cpu().numpy(), output_file, final_prob.cpu().numpy())]
     
     def _get_global_input(self, img, coarse_masks, ori_shape, current_device):
         model_size = self.test_cfg.get('model_size', 256)
@@ -153,6 +153,19 @@ class SegRefinerSemantic(SegRefiner):
         refined_mask = refined_mask / weight
         refined_mask = (refined_mask >= 0.5).float()
         return refined_area * refined_mask + (1 - refined_area) * mask
+
+    def paste_local_probs_patch(self, local_probs, fine_probs, patch_coors):
+        fine_probs = fine_probs.squeeze(0).squeeze(0)
+        refined_probs = torch.zeros_like(fine_probs)
+        weight = torch.zeros_like(fine_probs)
+        local_probs = local_probs.squeeze(1)
+        for local_prob, coor in zip(local_probs, patch_coors):
+            refined_probs[coor[1]:coor[3], coor[0]:coor[2]] += local_prob
+            weight[coor[1]:coor[3], coor[0]:coor[2]] += 1
+        refined_area = (weight > 0).float()
+        weight[weight == 0] = 1
+        refined_probs = refined_probs / weight
+        return refined_area * refined_probs + (1 - refined_area) * fine_probs
 
     def aug_test(self, imgs, img_metas, rescale=False):
         raise NotImplementedError
